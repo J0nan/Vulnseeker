@@ -162,7 +162,7 @@ export const searchVendors = async (query: string): Promise<string[]> => {
 
   // Use the search parameter to filter on the server side
   const url = `${BROWSE_API_URL}/browse/?vendor=${encodeURIComponent(query)}`;
-  const proxyUrl = `https://cors.ja1712.workers.dev/?url=?${encodeURIComponent(url)}`;
+  const proxyUrl = `https://cors.ja1712.workers.dev/?url=${encodeURIComponent(url)}`;
   
   try {
     const response = await fetch(proxyUrl);
@@ -197,7 +197,7 @@ export const getProductsByVendor = async (vendor: string): Promise<string[]> => 
   }
 
   const url = `${BROWSE_API_URL}/browse/${encodeURIComponent(vendor)}`;
-  const proxyUrl = `https://cors.ja1712.workers.dev/?url=?${encodeURIComponent(url)}`;
+  const proxyUrl = `https://cors.ja1712.workers.dev/?url=${encodeURIComponent(url)}`;
   
   try {
     const response = await fetch(proxyUrl);
@@ -245,7 +245,7 @@ export const searchCVEs = async (vendor: string, product: string): Promise<CVE[]
       
       // The CIRCL API does not support CORS for direct browser requests.
       // We use a CORS proxy to bypass this restriction.
-      const proxyUrl = `https://cors.ja1712.workers.dev/?url=?${encodeURIComponent(url)}`;
+      const proxyUrl = `https://cors.ja1712.workers.dev/?url=${encodeURIComponent(url)}`;
       const response = await fetch(proxyUrl);
       
       if (!response.ok) {
