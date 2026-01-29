@@ -16,12 +16,12 @@ export const Header: React.FC = () => {
         <div className="hidden md:flex items-center gap-6 text-sm text-slate-400 font-medium">
           <span>Powered by CIRCL.lu</span>
           <a 
-            href="https://github.com/advisories" 
+            href="https://github.com/J0nan/Vulnseeker" 
             target="_blank" 
             rel="noopener noreferrer"
             className="hover:text-blue-400 transition-colors"
           >
-            Advisories
+            Code
           </a>
         </div>
       </div>
