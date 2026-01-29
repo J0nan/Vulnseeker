@@ -1,0 +1,5 @@
+{
+  "name": "NEW VulnSeeker",
+  "description": "A modern interface to search for Common Vulnerabilities and Exposures (CVEs) by vendor and product using the CIRCL API.",
+  "requestFramePermissions": []
+}
