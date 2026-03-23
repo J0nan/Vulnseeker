@@ -5,16 +5,146 @@ const BROWSE_API_URL = 'https://cve.circl.lu/api';
 
 const RESTRICTED_VERSION_SOURCES = ['fkie_nvd', 'nvd', 'variot'];
 
-// Helper to extract CVSS from V5 metrics structure
-const extractCvssV5 = (metrics: any[]): number | null => {
-  if (!metrics || !Array.isArray(metrics)) return null;
-  for (const m of metrics) {
-    // Check for various CVSS versions, prioritizing newer ones
-    if (m.cvssV3_1?.baseScore) return typeof m.cvssV3_1.baseScore === 'number' ? m.cvssV3_1.baseScore : parseFloat(m.cvssV3_1.baseScore);
-    if (m.cvssV3_0?.baseScore) return typeof m.cvssV3_0.baseScore === 'number' ? m.cvssV3_0.baseScore : parseFloat(m.cvssV3_0.baseScore);
-    if (m.cvssV2_0?.baseScore) return typeof m.cvssV2_0.baseScore === 'number' ? m.cvssV2_0.baseScore : parseFloat(m.cvssV2_0.baseScore);
+type CvssScores = {
+  cvssV40: CvssMetricValue;
+  cvssV31: CvssMetricValue;
+  cvssV30: CvssMetricValue;
+  cvssV20: CvssMetricValue;
+};
+
+type CvssMetricValue = {
+  score: number | null;
+  vector: string | null;
+};
+
+const emptyCvssMetricValue = (): CvssMetricValue => ({
+  score: null,
+  vector: null
+});
+
+const emptyCvssScores = (): CvssScores => ({
+  cvssV40: emptyCvssMetricValue(),
+  cvssV31: emptyCvssMetricValue(),
+  cvssV30: emptyCvssMetricValue(),
+  cvssV20: emptyCvssMetricValue()
+});
+
+const parseCvssScore = (value: any): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
   }
+
+  if (typeof value === 'string') {
+    const parsed = parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
   return null;
+};
+
+const parseCvssVector = (value: any): string | null => {
+  if (typeof value !== 'string') return null;
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const keepHighestScore = (current: number | null, incoming: number | null): number | null => {
+  if (incoming === null) return current;
+  if (current === null || incoming > current) return incoming;
+  return current;
+};
+
+const keepPreferredMetric = (current: CvssMetricValue, incoming: CvssMetricValue): CvssMetricValue => {
+  if (incoming.score === null) {
+    return current;
+  }
+
+  if (current.score === null || incoming.score > current.score) {
+    return incoming;
+  }
+
+  if (incoming.score === current.score && current.vector === null && incoming.vector !== null) {
+    return incoming;
+  }
+
+  return current;
+};
+
+const mergeCvssScores = (base: CvssScores, incoming: CvssScores): CvssScores => ({
+  cvssV40: keepPreferredMetric(base.cvssV40, incoming.cvssV40),
+  cvssV31: keepPreferredMetric(base.cvssV31, incoming.cvssV31),
+  cvssV30: keepPreferredMetric(base.cvssV30, incoming.cvssV30),
+  cvssV20: keepPreferredMetric(base.cvssV20, incoming.cvssV20)
+});
+
+const extractCvssFromMetricArray = (metricArray: any[]): CvssMetricValue => {
+  if (!Array.isArray(metricArray)) return emptyCvssMetricValue();
+
+  let score = emptyCvssMetricValue();
+  for (const metric of metricArray) {
+    const parsedScore = parseCvssScore(metric?.cvssData?.baseScore ?? metric?.baseScore);
+    const parsedVector = parseCvssVector(metric?.cvssData?.vectorString ?? metric?.vectorString);
+    score = keepPreferredMetric(score, {
+      score: parsedScore,
+      vector: parsedVector
+    });
+  }
+
+  return score;
+};
+
+const extractCvssV5 = (metrics: any[]): CvssScores => {
+  if (!Array.isArray(metrics)) return emptyCvssScores();
+
+  let scores = emptyCvssScores();
+
+  for (const m of metrics) {
+    const metricScores: CvssScores = {
+      cvssV40: {
+        score: parseCvssScore(m?.cvssV4_0?.baseScore ?? m?.cvssV40?.baseScore ?? m?.cvssV4?.baseScore),
+        vector: parseCvssVector(m?.cvssV4_0?.vectorString ?? m?.cvssV40?.vectorString ?? m?.cvssV4?.vectorString)
+      },
+      cvssV31: {
+        score: parseCvssScore(m?.cvssV3_1?.baseScore ?? m?.cvssV31?.baseScore),
+        vector: parseCvssVector(m?.cvssV3_1?.vectorString ?? m?.cvssV31?.vectorString)
+      },
+      cvssV30: {
+        score: parseCvssScore(m?.cvssV3_0?.baseScore ?? m?.cvssV30?.baseScore),
+        vector: parseCvssVector(m?.cvssV3_0?.vectorString ?? m?.cvssV30?.vectorString)
+      },
+      cvssV20: {
+        score: parseCvssScore(m?.cvssV2_0?.baseScore ?? m?.cvssV20?.baseScore),
+        vector: parseCvssVector(m?.cvssV2_0?.vectorString ?? m?.cvssV20?.vectorString)
+      }
+    };
+
+    scores = mergeCvssScores(scores, metricScores);
+  }
+
+  return scores;
+};
+
+const extractLegacyCvss = (metrics: any): CvssScores => {
+  if (!metrics) return emptyCvssScores();
+
+  return {
+    cvssV40: extractCvssFromMetricArray(metrics.cvssMetricV40 || metrics.cvssMetricV4),
+    cvssV31: extractCvssFromMetricArray(metrics.cvssMetricV31),
+    cvssV30: extractCvssFromMetricArray(metrics.cvssMetricV30),
+    cvssV20: extractCvssFromMetricArray(metrics.cvssMetricV2)
+  };
+};
+
+const getCvssFallbackScore = (scores: CvssScores): number | null => {
+  if (scores.cvssV31.score !== null) return scores.cvssV31.score;
+  if (scores.cvssV30.score !== null) return scores.cvssV30.score;
+  if (scores.cvssV20.score !== null) return scores.cvssV20.score;
+  return null;
+};
+
+const getPrimaryCvssScore = (scores: CvssScores, legacyScore: number | null = null): number | null => {
+  return scores.cvssV40.score ?? getCvssFallbackScore(scores) ?? legacyScore;
 };
 
 // Helper to process raw API entries into CVE objects
@@ -45,18 +175,16 @@ const processEntries = (entries: any[], source: string): CVE[] => {
         
         // CVSS Score Extraction
         // 1. Try CNA metrics
-        let cvss = extractCvssV5(cna.metrics);
+        let cvssScores = extractCvssV5(cna.metrics);
         
         // 2. If no CNA score, check Authorized Data Providers (ADP)
-        if (cvss === null && containers.adp) {
+        if (containers.adp) {
             for (const adp of containers.adp) {
                 const adpCvss = extractCvssV5(adp.metrics);
-                if (adpCvss !== null) {
-                    cvss = adpCvss;
-                    break;
-                }
+                cvssScores = mergeCvssScores(cvssScores, adpCvss);
             }
         }
+        const cvss = getPrimaryCvssScore(cvssScores);
         
         // Configurations (CPEs or text description)
         const configs: string[] = [];
@@ -96,6 +224,14 @@ const processEntries = (entries: any[], source: string): CVE[] => {
             id,
             summary,
             cvss,
+            cvssV40: cvssScores.cvssV40.score,
+            cvssV31: cvssScores.cvssV31.score,
+            cvssV30: cvssScores.cvssV30.score,
+            cvssV20: cvssScores.cvssV20.score,
+            cvssVectorV40: cvssScores.cvssV40.vector,
+            cvssVectorV31: cvssScores.cvssV31.vector,
+            cvssVectorV30: cvssScores.cvssV30.vector,
+            cvssVectorV20: cvssScores.cvssV20.vector,
             Published,
             Modified,
             vulnerable_configuration: Array.from(new Set(configs)), // Remove duplicates
@@ -106,16 +242,9 @@ const processEntries = (entries: any[], source: string): CVE[] => {
     }
 
     // Legacy/Other format fallback (e.g. fkie_nvd, cert-fr, jvndb, circl)
-    let cvss = null;
-    if (item.metrics) {
-       if (item.metrics.cvssMetricV31 && item.metrics.cvssMetricV31.length > 0) {
-         cvss = item.metrics.cvssMetricV31[0].cvssData.baseScore;
-       } else if (item.metrics.cvssMetricV30 && item.metrics.cvssMetricV30.length > 0) {
-         cvss = item.metrics.cvssMetricV30[0].cvssData.baseScore;
-       } else if (item.metrics.cvssMetricV2 && item.metrics.cvssMetricV2.length > 0) {
-         cvss = item.metrics.cvssMetricV2[0].cvssData.baseScore;
-       }
-    }
+    const cvssScores = extractLegacyCvss(item.metrics);
+    const legacyCvss = parseCvssScore(item.cvss);
+    const cvss = getPrimaryCvssScore(cvssScores, legacyCvss);
 
     // Extract summary: check summary, title, or descriptions array
     const summary = item.summary || item.title || item.descriptions?.find((d: any) => d.lang === 'en')?.value || "No description available";
@@ -137,7 +266,15 @@ const processEntries = (entries: any[], source: string): CVE[] => {
     return {
       id: item.id || item.cve_id || "Unknown ID",
       summary,
-      cvss: typeof item.cvss === 'number' ? item.cvss : (cvss || (item.cvss ? parseFloat(item.cvss) : null)),
+      cvss,
+      cvssV40: cvssScores.cvssV40.score,
+      cvssV31: cvssScores.cvssV31.score,
+      cvssV30: cvssScores.cvssV30.score,
+      cvssV20: cvssScores.cvssV20.score,
+      cvssVectorV40: cvssScores.cvssV40.vector,
+      cvssVectorV31: cvssScores.cvssV31.vector,
+      cvssVectorV30: cvssScores.cvssV30.vector,
+      cvssVectorV20: cvssScores.cvssV20.vector,
       Published: item.published || item.Published || new Date().toISOString(),
       Modified: item.lastModified || item.Modified || new Date().toISOString(),
       vulnerable_configuration: configs.length > 0 ? configs : [],
@@ -303,11 +440,68 @@ export const searchCVEs = async (vendor: string, product: string): Promise<CVE[]
                 }
 
                 // Maximize CVSS (Keep the highest score found across all sources)
-                if (cve.cvss !== null) {
-                    if (existing.cvss === null || cve.cvss > existing.cvss) {
-                        existing.cvss = cve.cvss;
+                const mergedCvssV40 = keepPreferredMetric(
+                    {
+                        score: existing.cvssV40 ?? null,
+                        vector: existing.cvssVectorV40 ?? null
+                    },
+                    {
+                        score: cve.cvssV40 ?? null,
+                        vector: cve.cvssVectorV40 ?? null
                     }
-                }
+                );
+                existing.cvssV40 = mergedCvssV40.score;
+                existing.cvssVectorV40 = mergedCvssV40.vector;
+
+                const mergedCvssV31 = keepPreferredMetric(
+                    {
+                        score: existing.cvssV31 ?? null,
+                        vector: existing.cvssVectorV31 ?? null
+                    },
+                    {
+                        score: cve.cvssV31 ?? null,
+                        vector: cve.cvssVectorV31 ?? null
+                    }
+                );
+                existing.cvssV31 = mergedCvssV31.score;
+                existing.cvssVectorV31 = mergedCvssV31.vector;
+
+                const mergedCvssV30 = keepPreferredMetric(
+                    {
+                        score: existing.cvssV30 ?? null,
+                        vector: existing.cvssVectorV30 ?? null
+                    },
+                    {
+                        score: cve.cvssV30 ?? null,
+                        vector: cve.cvssVectorV30 ?? null
+                    }
+                );
+                existing.cvssV30 = mergedCvssV30.score;
+                existing.cvssVectorV30 = mergedCvssV30.vector;
+
+                const mergedCvssV20 = keepPreferredMetric(
+                    {
+                        score: existing.cvssV20 ?? null,
+                        vector: existing.cvssVectorV20 ?? null
+                    },
+                    {
+                        score: cve.cvssV20 ?? null,
+                        vector: cve.cvssVectorV20 ?? null
+                    }
+                );
+                existing.cvssV20 = mergedCvssV20.score;
+                existing.cvssVectorV20 = mergedCvssV20.vector;
+
+                const mergedLegacyCvss = keepHighestScore(existing.cvss ?? null, cve.cvss ?? null);
+                existing.cvss = getPrimaryCvssScore(
+                    {
+                        cvssV40: mergedCvssV40,
+                        cvssV31: mergedCvssV31,
+                        cvssV30: mergedCvssV30,
+                        cvssV20: mergedCvssV20
+                    },
+                    mergedLegacyCvss
+                );
                 
                 // Config Merging Logic (Prioritize Trusted, Fallback to Restricted)
                 if (isTrusted) {

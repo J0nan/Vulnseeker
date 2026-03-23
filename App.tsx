@@ -7,12 +7,81 @@ import { Autocomplete } from './components/Autocomplete';
 import { SavedSearches } from './components/SavedSearches';
 import { Search, AlertTriangle, Database, Info, Box, Save } from 'lucide-react';
 
+type CvssSortBasis = 'cvssV40' | 'cvssFallback';
+
+type SeverityCounts = {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  unknown: number;
+};
+
+type SeverityLevel = keyof SeverityCounts;
+type SeverityFilter = SeverityLevel | 'all';
+
+const severityChipConfig: Array<{ level: SeverityLevel; label: string; className: string }> = [
+  { level: 'critical', label: 'Critical', className: 'bg-purple-900/30 text-purple-300 border border-purple-800/50' },
+  { level: 'high', label: 'High', className: 'bg-red-900/30 text-red-300 border border-red-800/50' },
+  { level: 'medium', label: 'Medium', className: 'bg-orange-900/30 text-orange-300 border border-orange-800/50' },
+  { level: 'low', label: 'Low', className: 'bg-green-900/30 text-green-300 border border-green-800/50' },
+  { level: 'unknown', label: 'Unknown', className: 'bg-slate-700/40 text-slate-300 border border-slate-600/60' }
+];
+
+const getCvssFallbackScore = (cve: CVE): number | null => {
+  return cve.cvssV31 ?? cve.cvssV30 ?? cve.cvssV20 ?? null;
+};
+
+const createSeverityCounts = (): SeverityCounts => ({
+  critical: 0,
+  high: 0,
+  medium: 0,
+  low: 0,
+  unknown: 0
+});
+
+const incrementSeverityCounts = (counts: SeverityCounts, score: number | null | undefined): void => {
+  if (score === null || score === undefined) {
+    counts.unknown++;
+  } else if (score >= 9.0) {
+    counts.critical++;
+  } else if (score >= 7.0) {
+    counts.high++;
+  } else if (score >= 4.0) {
+    counts.medium++;
+  } else {
+    counts.low++;
+  }
+};
+
+const getSeverityLevel = (score: number | null | undefined): SeverityLevel => {
+  if (score === null || score === undefined) {
+    return 'unknown';
+  }
+
+  if (score >= 9.0) {
+    return 'critical';
+  }
+
+  if (score >= 7.0) {
+    return 'high';
+  }
+
+  if (score >= 4.0) {
+    return 'medium';
+  }
+
+  return 'low';
+};
+
 function App() {
   const [vendor, setVendor] = useState('');
   const [product, setProduct] = useState('');
   const [cves, setCves] = useState<CVE[]>([]);
   const [loadingState, setLoadingState] = useState<LoadingState>(LoadingState.IDLE);
   const [errorMsg, setErrorMsg] = useState<string>('');
+  const [cvssSortBasis, setCvssSortBasis] = useState<CvssSortBasis>('cvssV40');
+  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
   
   // State for product autocomplete
   const [vendorProducts, setVendorProducts] = useState<string[]>([]);
@@ -38,23 +107,82 @@ function App() {
   }, [savedSearches]);
 
   const stats = useMemo(() => {
-    const counts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
+    const cvssV40 = createSeverityCounts();
+    const cvssFallback = createSeverityCounts();
+
     cves.forEach(cve => {
-      const score = cve.cvss;
-      if (score === null || score === undefined) {
-        counts.unknown++;
-      } else if (score >= 9.0) {
-        counts.critical++;
-      } else if (score >= 7.0) {
-        counts.high++;
-      } else if (score >= 4.0) {
-        counts.medium++;
-      } else {
-        counts.low++;
-      }
+      incrementSeverityCounts(cvssV40, cve.cvssV40);
+      incrementSeverityCounts(cvssFallback, getCvssFallbackScore(cve));
     });
-    return counts;
+
+    return {
+      cvssV40,
+      cvssFallback
+    };
   }, [cves]);
+
+  const filteredSortedCves = useMemo(() => {
+    const getSelectedScore = (cve: CVE) => {
+      return cvssSortBasis === 'cvssV40' ? (cve.cvssV40 ?? null) : getCvssFallbackScore(cve);
+    };
+
+    return cves
+      .filter((cve) => {
+        if (severityFilter === 'all') {
+          return true;
+        }
+
+        return getSeverityLevel(getSelectedScore(cve)) === severityFilter;
+      })
+      .sort((a, b) => {
+        const scoreA = getSelectedScore(a) ?? -1;
+        const scoreB = getSelectedScore(b) ?? -1;
+        return scoreB - scoreA;
+      });
+  }, [cves, cvssSortBasis, severityFilter]);
+
+  const handleSeverityChipClick = (group: CvssSortBasis, severity: SeverityLevel) => {
+    setCvssSortBasis(group);
+    setSeverityFilter((prevFilter) => {
+      if (cvssSortBasis === group && prevFilter === severity) {
+        return 'all';
+      }
+
+      return severity;
+    });
+  };
+
+  const renderSeverityChips = (group: CvssSortBasis, counts: SeverityCounts) => {
+    return severityChipConfig.map(({ level, label, className }) => {
+      const count = counts[level];
+      if (count === 0) {
+        return null;
+      }
+
+      const isActive = cvssSortBasis === group && severityFilter === level;
+      const isFilterActive = severityFilter !== 'all';
+      const chipVisualClass = isActive
+        ? 'ring-2 ring-blue-400/80 shadow-md shadow-blue-500/20'
+        : isFilterActive
+          ? 'opacity-45 grayscale-[0.35] saturate-50 hover:opacity-60'
+          : cvssSortBasis === group
+            ? 'hover:brightness-110'
+            : 'opacity-80 hover:opacity-100';
+
+      return (
+        <button
+          key={`${group}-${level}`}
+          type="button"
+          onClick={() => handleSeverityChipClick(group, level)}
+          aria-pressed={isActive}
+          className={`px-2 py-1 rounded text-xs font-semibold transition-all ${className} ${chipVisualClass}`}
+          title={isActive ? `Clear ${label} filter` : `Filter by ${label} (${group === 'cvssV40' ? 'CVSS v4.0' : 'fallback'})`}
+        >
+          {count} {label}
+        </button>
+      );
+    });
+  };
 
   const handleSearch = async (e: FormEvent) => {
     e.preventDefault();
@@ -63,19 +191,14 @@ function App() {
     setLoadingState(LoadingState.LOADING);
     setErrorMsg('');
     setCves([]);
+    setSeverityFilter('all');
 
     try {
       const results = await searchCVEs(vendor, product);
       if (results.length === 0) {
         setLoadingState(LoadingState.EMPTY);
       } else {
-        // Sort by CVSS score descending (high to low), putting null/undefined at the end
-        const sortedResults = results.sort((a, b) => {
-          const scoreA = a.cvss ?? -1;
-          const scoreB = b.cvss ?? -1;
-          return scoreB - scoreA;
-        });
-        setCves(sortedResults);
+        setCves(results);
         setLoadingState(LoadingState.SUCCESS);
       }
     } catch (err) {
@@ -111,6 +234,7 @@ function App() {
     setCves(search.cves);
     setLoadingState(LoadingState.SUCCESS);
     setErrorMsg('');
+    setSeverityFilter('all');
     
     // Optionally fetch products for the loaded vendor to populate the dropdown
     handleVendorSelect(search.vendor);
@@ -263,51 +387,76 @@ function App() {
 
           {loadingState === LoadingState.SUCCESS && (
             <>
-              <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
-                <h3 className="text-xl font-bold text-white flex items-center gap-2">
-                  Results 
-                  <span className="px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400 text-sm font-mono">
-                    {cves.length} found
-                  </span>
-                </h3>
-                
-                <div className="flex flex-col md:flex-row gap-4 md:items-center">
-                    <div className="flex flex-wrap gap-2">
-                        {stats.critical > 0 && (
-                            <span className="px-2 py-1 rounded text-xs font-semibold bg-purple-900/30 text-purple-300 border border-purple-800/50">
-                                {stats.critical} Critical
-                            </span>
-                        )}
-                        {stats.high > 0 && (
-                            <span className="px-2 py-1 rounded text-xs font-semibold bg-red-900/30 text-red-300 border border-red-800/50">
-                                {stats.high} High
-                            </span>
-                        )}
-                        {stats.medium > 0 && (
-                            <span className="px-2 py-1 rounded text-xs font-semibold bg-orange-900/30 text-orange-300 border border-orange-800/50">
-                                {stats.medium} Medium
-                            </span>
-                        )}
-                        {stats.low > 0 && (
-                            <span className="px-2 py-1 rounded text-xs font-semibold bg-green-900/30 text-green-300 border border-green-800/50">
-                                {stats.low} Low
-                            </span>
-                        )}
+              <div className="mb-6 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                    Results
+                    <span className="px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400 text-sm font-mono">
+                      {severityFilter === 'all' ? `${cves.length} found` : `${filteredSortedCves.length}/${cves.length} shown`}
+                    </span>
+                  </h3>
+
+                  <button
+                    onClick={handleSaveSearch}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-white rounded-lg border border-slate-700 hover:border-slate-600 transition-all shadow-sm"
+                    title="Save this search snapshot"
+                  >
+                    <Save className="w-4 h-4" />
+                    Save Snapshot
+                  </button>
+                </div>
+
+                <div className="flex flex-col xl:flex-row gap-4 xl:items-center xl:justify-between">
+                  <div className="rounded-xl border border-slate-700/70 bg-slate-900/40 p-3">
+                    <div className="mb-3 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setSeverityFilter('all')}
+                        disabled={severityFilter === 'all'}
+                        className="px-3 py-1.5 rounded text-xs font-semibold border border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="Clear severity filter"
+                      >
+                        All severities
+                      </button>
                     </div>
-                    
-                    <button
-                        onClick={handleSaveSearch}
-                        className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-white rounded-lg border border-slate-700 hover:border-slate-600 transition-all shadow-sm"
-                        title="Save this search snapshot"
-                    >
-                        <Save className="w-4 h-4" />
-                        Save Snapshot
-                    </button>
+
+                    <div className="flex flex-col lg:flex-row gap-3 lg:items-stretch">
+                      <div className={`flex flex-col gap-2 rounded-lg border p-2 ${cvssSortBasis === 'cvssV40' ? 'border-blue-500/60 bg-blue-950/30' : 'border-slate-700/70 bg-slate-900/60'}`}>
+                        <span className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">CVSS v4.0</span>
+                        <div className="flex flex-wrap gap-2">
+                          {renderSeverityChips('cvssV40', stats.cvssV40)}
+                        </div>
+                      </div>
+
+                      <div className="hidden lg:block w-px bg-slate-700/80" />
+
+                      <div className={`flex flex-col gap-2 rounded-lg border p-2 ${cvssSortBasis === 'cvssFallback' ? 'border-blue-500/60 bg-blue-950/30' : 'border-slate-700/70 bg-slate-900/60'}`}>
+                        <span className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Fallback (3.1→3.0→2.0)</span>
+                        <div className="flex flex-wrap gap-2">
+                          {renderSeverityChips('cvssFallback', stats.cvssFallback)}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <label className="flex items-center gap-2 text-xs text-slate-400">
+                      <span className="whitespace-nowrap">Sort by score:</span>
+                      <select
+                        value={cvssSortBasis}
+                        onChange={(e) => setCvssSortBasis(e.target.value as CvssSortBasis)}
+                        className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 focus:border-blue-500 focus:outline-none"
+                      >
+                        <option value="cvssV40">CVSS v4.0</option>
+                        <option value="cvssFallback">CVSS 3.x fallback (3.1→3.0→2.0)</option>
+                      </select>
+                    </label>
+                  </div>
                 </div>
               </div>
               
               <div className="grid grid-cols-1 gap-4">
-                {cves.map((cve) => (
+                {filteredSortedCves.map((cve) => (
                   <CVECard key={cve.id} cve={cve} onDelete={() => handleDelete(cve.id)} />
                 ))}
               </div>
