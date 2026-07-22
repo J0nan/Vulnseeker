@@ -24,7 +24,7 @@ type CvssMetricValue = {
  */
 async function fetchNvdByCpe(cpeString: string): Promise<Map<string, CvssScores>> {
   const cveScores = new Map<string, CvssScores>();
-  const RESULTS_PER_PAGE = 100; // NVD maximum results per page
+  const RESULTS_PER_PAGE = 500; // NVD maximum results per page
   let startIndex = 0;
   let totalResults = 1;
 
