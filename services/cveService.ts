@@ -763,7 +763,7 @@ export const enrichCvssVectorsInBackground = (
   }
 
   const BATCH_SIZE = 5;
-  const BATCH_DELAY_MS = 3000; // 7 seconds between batches to stay under 50 req / 30 sec
+  const BATCH_DELAY_MS = 3000;
 
   const run = async () => {
     let completed = 0;
