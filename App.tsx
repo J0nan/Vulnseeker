@@ -1,11 +1,13 @@
-import React, { useState, FormEvent, useMemo, useEffect } from 'react';
+import React, { useState, FormEvent, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Header } from './components/Header';
 import { CVE, LoadingState, SavedSearch } from './types';
-import { searchCVEs, searchVendors, getProductsByVendor } from './services/cveService';
+import { searchCVEs, searchVendors, getProductsByVendor, enrichCvssVectorsInBackground } from './services/cveService';
 import { CVECard } from './components/CVECard';
 import { Autocomplete } from './components/Autocomplete';
 import { SavedSearches } from './components/SavedSearches';
-import { Search, AlertTriangle, Database, Info, Box, Save } from 'lucide-react';
+import { Search, AlertTriangle, Database, Info, Box, Save, Sparkles, RefreshCw, CheckCircle, Shield } from 'lucide-react';
+import { AIFilterModal } from './components/AIFilterModal';
+import { CPEFilterModal } from './components/CPEFilterModal';
 
 type CvssSortBasis = 'cvssV40' | 'cvssFallback';
 
@@ -82,6 +84,69 @@ function App() {
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [cvssSortBasis, setCvssSortBasis] = useState<CvssSortBasis>('cvssV40');
   const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
+  const [isAIFilterOpen, setIsAIFilterOpen] = useState(false);
+  const [isCPEFilterOpen, setIsCPEFilterOpen] = useState(false);
+  const [activeCPEString, setActiveCPEString] = useState<string | null>(null);
+
+  const [wasEnrichmentCancelledForFilter, setWasEnrichmentCancelledForFilter] = useState(false);
+  const [pendingEnrichmentRestart, setPendingEnrichmentRestart] = useState(false);
+
+  // Background enrichment state
+  const [enrichmentStatus, setEnrichmentStatus] = useState<{ active: boolean; completed: number; total: number; done: boolean }>({ active: false, completed: 0, total: 0, done: false });
+  const enrichmentAbortRef = useRef<AbortController | null>(null);
+
+  // Auto-dismiss the "done" banner after 5 seconds
+  useEffect(() => {
+    if (enrichmentStatus.done) {
+      const timer = setTimeout(() => setEnrichmentStatus(prev => ({ ...prev, done: false })), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [enrichmentStatus.done]);
+
+  // Cancel enrichment on unmount
+  useEffect(() => {
+    return () => { enrichmentAbortRef.current?.abort(); };
+  }, []);
+
+  const startEnrichment = useCallback((cveList: CVE[]) => {
+      const controller = enrichCvssVectorsInBackground(cveList, {
+          onProgress: (updatedCves, completed, total) => {
+            setCves(prev => [...prev]);
+            setEnrichmentStatus({ active: true, completed, total, done: false });
+          },
+          onComplete: (updatedCves) => {
+            setCves(prev => [...prev]);
+            setEnrichmentStatus({ active: false, completed: 0, total: 0, done: true });
+            enrichmentAbortRef.current = null;
+          }
+      });
+      enrichmentAbortRef.current = controller;
+      const needsVector = cveList.filter(cve =>
+        cve.vulnStatus !== 'REJECTED' && cve.cvss !== null &&
+        !cve.cvssVectorV40 && !cve.cvssVectorV31 && !cve.cvssVectorV30 && !cve.cvssVectorV20
+      );
+      if (needsVector.length > 0) {
+        setEnrichmentStatus({ active: true, completed: 0, total: needsVector.length, done: false });
+      }
+  }, []);
+
+  const executeFilterAction = (applyFilter: () => void, isAsyncModal: boolean = false) => {
+      if (enrichmentStatus.active) {
+          if (window.confirm("The background task of Fetching CVSS vectors from NVD is running. Do you want it to stop?")) {
+              enrichmentAbortRef.current?.abort();
+              enrichmentAbortRef.current = null;
+              setEnrichmentStatus(prev => ({ ...prev, active: false }));
+              applyFilter();
+              if (isAsyncModal) {
+                  setWasEnrichmentCancelledForFilter(true);
+              } else {
+                  setPendingEnrichmentRestart(true);
+              }
+          }
+      } else {
+          applyFilter();
+      }
+  };
   
   // State for product autocomplete
   const [vendorProducts, setVendorProducts] = useState<string[]>([]);
@@ -141,15 +206,24 @@ function App() {
       });
   }, [cves, cvssSortBasis, severityFilter]);
 
-  const handleSeverityChipClick = (group: CvssSortBasis, severity: SeverityLevel) => {
-    setCvssSortBasis(group);
-    setSeverityFilter((prevFilter) => {
-      if (cvssSortBasis === group && prevFilter === severity) {
-        return 'all';
-      }
+  useEffect(() => {
+    if (pendingEnrichmentRestart) {
+       startEnrichment(filteredSortedCves);
+       setPendingEnrichmentRestart(false);
+    }
+  }, [filteredSortedCves, pendingEnrichmentRestart, startEnrichment]);
 
-      return severity;
-    });
+  const handleSeverityChipClick = (group: CvssSortBasis, severity: SeverityLevel) => {
+    executeFilterAction(() => {
+      setCvssSortBasis(group);
+      setSeverityFilter((prevFilter) => {
+        if (cvssSortBasis === group && prevFilter === severity) {
+          return 'all';
+        }
+
+        return severity;
+      });
+    }, false);
   };
 
   const renderSeverityChips = (group: CvssSortBasis, counts: SeverityCounts) => {
@@ -188,10 +262,16 @@ function App() {
     e.preventDefault();
     if (!vendor || !product) return;
 
+    // Cancel any in-flight enrichment from a previous search
+    enrichmentAbortRef.current?.abort();
+    enrichmentAbortRef.current = null;
+    setEnrichmentStatus({ active: false, completed: 0, total: 0, done: false });
+
     setLoadingState(LoadingState.LOADING);
     setErrorMsg('');
     setCves([]);
     setSeverityFilter('all');
+    setActiveCPEString(null);
 
     try {
       const results = await searchCVEs(vendor, product);
@@ -200,6 +280,9 @@ function App() {
       } else {
         setCves(results);
         setLoadingState(LoadingState.SUCCESS);
+
+        // Kick off background NVD vector enrichment
+        startEnrichment(results);
       }
     } catch (err) {
       setLoadingState(LoadingState.ERROR);
@@ -265,7 +348,6 @@ function App() {
     setSavedSearches(prev => [...newItems, ...prev]);
   };
   
-  // When a vendor is selected, fetch products for that vendor
   const handleVendorSelect = async (selectedVendor: string) => {
       if (!selectedVendor) return;
       setIsFetchingProducts(true);
@@ -277,6 +359,24 @@ function App() {
           console.error("Failed to load products", e);
       } finally {
           setIsFetchingProducts(false);
+      }
+  };
+
+  const handleAIFilterApply = (filteredCves: CVE[]) => {
+      setCves(filteredCves);
+      setActiveCPEString(null);
+      if (wasEnrichmentCancelledForFilter) {
+          setPendingEnrichmentRestart(true);
+          setWasEnrichmentCancelledForFilter(false);
+      }
+  };
+
+  const handleCPEFilterApply = (filteredCves: CVE[], cpeString: string) => {
+      setCves(filteredCves);
+      setActiveCPEString(cpeString);
+      if (wasEnrichmentCancelledForFilter) {
+          setPendingEnrichmentRestart(true);
+          setWasEnrichmentCancelledForFilter(false);
       }
   };
 
@@ -394,16 +494,46 @@ function App() {
                     <span className="px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400 text-sm font-mono">
                       {severityFilter === 'all' ? `${cves.length} found` : `${filteredSortedCves.length}/${cves.length} shown`}
                     </span>
+                    {activeCPEString && (
+                      <a 
+                        href={`https://nvd.nist.gov/vuln/search#/nvd/home?cpeFilterMode=cpe&cpeName=${encodeURIComponent(activeCPEString)}&resultType=records`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="ml-4 text-xs font-medium text-blue-400 hover:text-blue-300 flex items-center gap-1 hover:underline"
+                        title="View on NIST National Vulnerability Database"
+                      >
+                        <Shield className="w-3.5 h-3.5" />
+                        View in NIST NVD
+                      </a>
+                    )}
                   </h3>
 
-                  <button
-                    onClick={handleSaveSearch}
-                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-white rounded-lg border border-slate-700 hover:border-slate-600 transition-all shadow-sm"
-                    title="Save this search snapshot"
-                  >
-                    <Save className="w-4 h-4" />
-                    Save Snapshot
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => executeFilterAction(() => setIsAIFilterOpen(true), true)}
+                      className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-purple-600 hover:bg-purple-500 rounded-lg border border-purple-500 hover:border-purple-400 transition-all shadow-sm shadow-purple-900/50"
+                      title="Filter results for a specific version using AI"
+                    >
+                      <Sparkles className="w-4 h-4" />
+                      Filter Version (AI)
+                    </button>
+                    <button
+                      onClick={() => executeFilterAction(() => setIsCPEFilterOpen(true), true)}
+                      className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-500 rounded-lg border border-blue-500 hover:border-blue-400 transition-all shadow-sm shadow-blue-900/50"
+                      title="Filter results for a specific version using NVD API"
+                    >
+                      <Shield className="w-4 h-4" />
+                      Filter Version (NVD)
+                    </button>
+                    <button
+                      onClick={handleSaveSearch}
+                      className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-white rounded-lg border border-slate-700 hover:border-slate-600 transition-all shadow-sm"
+                      title="Save this search snapshot"
+                    >
+                      <Save className="w-4 h-4" />
+                      Save Snapshot
+                    </button>
+                  </div>
                 </div>
 
                 <div className="flex flex-col xl:flex-row gap-4 xl:items-center xl:justify-between">
@@ -411,7 +541,7 @@ function App() {
                     <div className="mb-3 flex justify-end">
                       <button
                         type="button"
-                        onClick={() => setSeverityFilter('all')}
+                        onClick={() => executeFilterAction(() => setSeverityFilter('all'), false)}
                         disabled={severityFilter === 'all'}
                         className="px-3 py-1.5 rounded text-xs font-semibold border border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         title="Clear severity filter"
@@ -455,6 +585,28 @@ function App() {
                 </div>
               </div>
               
+              {/* Background enrichment banner */}
+              {enrichmentStatus.active && (
+                <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-blue-950/40 border border-blue-800/40 text-blue-300 text-sm mb-2 animate-in">
+                  <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+                  <span>
+                    Fetching CVSS vectors from NVD… <span className="font-mono text-blue-400">{enrichmentStatus.completed}/{enrichmentStatus.total}</span>
+                  </span>
+                  <div className="flex-1 h-1.5 bg-blue-900/50 rounded-full overflow-hidden ml-2">
+                    <div
+                      className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
+                      style={{ width: `${enrichmentStatus.total > 0 ? (enrichmentStatus.completed / enrichmentStatus.total) * 100 : 0}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+              {enrichmentStatus.done && (
+                <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-green-950/40 border border-green-800/40 text-green-300 text-sm mb-2">
+                  <CheckCircle className="w-4 h-4 shrink-0" />
+                  <span>CVSS vectors enriched successfully.</span>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 gap-4">
                 {filteredSortedCves.map((cve) => (
                   <CVECard key={cve.id} cve={cve} onDelete={() => handleDelete(cve.id)} />
@@ -463,6 +615,34 @@ function App() {
             </>
           )}
         </div>
+
+        <AIFilterModal 
+          isOpen={isAIFilterOpen} 
+          onClose={() => {
+              setIsAIFilterOpen(false);
+              if (wasEnrichmentCancelledForFilter) {
+                  setPendingEnrichmentRestart(true);
+                  setWasEnrichmentCancelledForFilter(false);
+              }
+          }} 
+          onApply={handleAIFilterApply} 
+          productName={product} 
+          cves={cves}
+        />
+
+        <CPEFilterModal
+          isOpen={isCPEFilterOpen}
+          onClose={() => {
+              setIsCPEFilterOpen(false);
+              if (wasEnrichmentCancelledForFilter) {
+                  setPendingEnrichmentRestart(true);
+                  setWasEnrichmentCancelledForFilter(false);
+              }
+          }}
+          onApply={handleCPEFilterApply}
+          vendor={vendor}
+          product={product}
+        />
       </main>
       
       <footer className="py-8 text-center text-slate-600 text-sm">

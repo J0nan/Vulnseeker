@@ -3,6 +3,7 @@ import { CVE } from '../types';
 const BASE_URL = 'https://vulnerability.circl.lu/api';
 const BROWSE_API_URL = 'https://cve.circl.lu/api';
 
+// const RESTRICTED_VERSION_SOURCES = ['variot'];
 const RESTRICTED_VERSION_SOURCES = ['fkie_nvd', 'nvd', 'variot'];
 
 type CvssScores = {
@@ -16,6 +17,55 @@ type CvssMetricValue = {
   score: number | null;
   vector: string | null;
 };
+
+/**
+ * Paginates through NVD to retrieve all CVEs matching the given CPE.
+ * Returns a map of CVE ID -> CvssScores.
+ */
+async function fetchNvdByCpe(cpeString: string): Promise<Map<string, CvssScores>> {
+  const cveScores = new Map<string, CvssScores>();
+  const RESULTS_PER_PAGE = 100; // NVD maximum results per page
+  let startIndex = 0;
+  let totalResults = 1;
+
+  while (startIndex < totalResults) {
+    const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=${encodeURIComponent(cpeString)}&resultsPerPage=${RESULTS_PER_PAGE}&startIndex=${startIndex}`;
+    const proxyUrl = `https://cors.ja1712.workers.dev/?url=${encodeURIComponent(url)}`;
+
+    try {
+      // Small delay between paginated requests to respect rate limits
+      if (startIndex > 0) {
+        await new Promise(r => setTimeout(r, 6000));
+      }
+
+      const res = await fetch(proxyUrl);
+      if (!res.ok) {
+        console.warn(`NVD CPE fetch failed for page starting at ${startIndex} (status: ${res.status})`);
+        break;
+      }
+
+      const data = await res.json();
+      if (!data || !data.vulnerabilities) break;
+
+      totalResults = data.totalResults || 0;
+
+      for (const item of data.vulnerabilities) {
+        const cveId = item.cve?.id;
+        const metrics = item.cve?.metrics;
+        if (cveId && metrics) {
+          cveScores.set(cveId, extractLegacyCvss(metrics));
+        }
+      }
+
+      startIndex += RESULTS_PER_PAGE;
+    } catch (e) {
+      console.warn(`Error during NVD CPE fetch for ${cpeString}`, e);
+      break;
+    }
+  }
+
+  return cveScores;
+}
 
 const emptyCvssMetricValue = (): CvssMetricValue => ({
   score: null,
@@ -579,7 +629,89 @@ export const searchCVEs = async (vendor: string, product: string): Promise<CVE[]
         });
       }
 
-      return Array.from(resultsMap.values()).map(entry => entry.cve);
+      let finalCVEs = Array.from(resultsMap.values()).map(entry => entry.cve);
+
+      // Phase 1: Bulk enrich from NVD using CPE search
+      const parts = ['a', 'o', 'h'];
+      let nvdBulkData = new Map<string, CvssScores>();
+      for (const part of parts) {
+        const cpeString = `cpe:2.3:${part}:${safeVendor}:${safeProduct}:-:*:*:*:*:*:*:*`;
+        nvdBulkData = await fetchNvdByCpe(cpeString);
+        if (nvdBulkData.size > 0) {
+          break; // Found results for this part, stop trying others
+        }
+      }
+
+      // Enrich finalCVEs with the NVD bulk data
+      if (nvdBulkData.size > 0) {
+        for (const cve of finalCVEs) {
+          const nvdScore = nvdBulkData.get(cve.id);
+          if (nvdScore) {
+            // Fill missing vectors and their associated scores (only if missing from CIRCL)
+            if (!cve.cvssVectorV40 && nvdScore.cvssV40.vector) {
+              cve.cvssVectorV40 = nvdScore.cvssV40.vector;
+              if (!cve.cvssV40) cve.cvssV40 = nvdScore.cvssV40.score;
+            }
+            if (!cve.cvssVectorV31 && nvdScore.cvssV31.vector) {
+              cve.cvssVectorV31 = nvdScore.cvssV31.vector;
+              if (!cve.cvssV31) cve.cvssV31 = nvdScore.cvssV31.score;
+            }
+            if (!cve.cvssVectorV30 && nvdScore.cvssV30.vector) {
+              cve.cvssVectorV30 = nvdScore.cvssV30.vector;
+              if (!cve.cvssV30) cve.cvssV30 = nvdScore.cvssV30.score;
+            }
+            if (!cve.cvssVectorV20 && nvdScore.cvssV20.vector) {
+              cve.cvssVectorV20 = nvdScore.cvssV20.vector;
+              if (!cve.cvssV20) cve.cvssV20 = nvdScore.cvssV20.score;
+            }
+
+            // Set primary score if CIRCL didn't provide one
+            if (cve.cvss === null) {
+              cve.cvss = getPrimaryCvssScore(nvdScore);
+            }
+          }
+        }
+      }
+
+      // Phase 2: Immediately enrich any STILL missing scores via Shodan (fast, no rate limits)
+      const cvesMissingCvss = finalCVEs.filter(cve => cve.cvss === null && cve.vulnStatus !== 'REJECTED');
+      
+      if (cvesMissingCvss.length > 0) {
+        const fetchScoreFromShodan = async (cve: CVE) => {
+          try {
+            const url = `https://cvedb.shodan.io/cve/${cve.id}`;
+            const proxyUrl = `https://cors.ja1712.workers.dev/?url=${encodeURIComponent(url)}`;
+            const res = await fetch(proxyUrl);
+            if (res.ok) {
+              const data = await res.json();
+              if (data.cvss_v4) cve.cvssV40 = data.cvss_v4;
+              if (data.cvss_v3) {
+                if (data.cvss_version === '3.0' || data.cvss_version === 3.0) {
+                  cve.cvssV30 = data.cvss_v3;
+                } else {
+                  cve.cvssV31 = data.cvss_v3;
+                }
+              }
+              if (data.cvss_v2) cve.cvssV20 = data.cvss_v2;
+              if (data.cvss) {
+                cve.cvss = data.cvss;
+              } else {
+                cve.cvss = getPrimaryCvssScore({
+                  cvssV40: { score: cve.cvssV40 ?? null, vector: null },
+                  cvssV31: { score: cve.cvssV31 ?? null, vector: null },
+                  cvssV30: { score: cve.cvssV30 ?? null, vector: null },
+                  cvssV20: { score: cve.cvssV20 ?? null, vector: null }
+                });
+              }
+            }
+          } catch (e) {
+            console.warn(`Shodan fetch failed for ${cve.id}`, e);
+          }
+        };
+        await Promise.all(cvesMissingCvss.map(fetchScoreFromShodan));
+      }
+
+      return finalCVEs;
     }
     
     // 4. Handle legacy array format (direct list of CVE objects)
@@ -593,4 +725,111 @@ export const searchCVEs = async (vendor: string, product: string): Promise<CVE[]
     console.error("Error fetching CVEs:", error);
     throw error;
   }
+};
+
+export interface EnrichmentCallbacks {
+  /** Called after each batch with the updated CVE list and progress info */
+  onProgress: (updatedCves: CVE[], completed: number, total: number) => void;
+  /** Called when all batches are done */
+  onComplete: (updatedCves: CVE[]) => void;
+}
+
+/**
+ * Enriches CVEs that have CVSS scores (from Shodan) but are missing vector strings
+ * by fetching from the NVD API in small batches to respect rate limits.
+ * Runs in the background — does not block the UI.
+ * 
+ * @param cves The full CVE list (will be mutated in-place for the enriched entries)
+ * @param callbacks Progress and completion callbacks
+ * @returns An AbortController that can be used to cancel the enrichment
+ */
+export const enrichCvssVectorsInBackground = (
+  cves: CVE[],
+  callbacks: EnrichmentCallbacks
+): AbortController => {
+  const controller = new AbortController();
+  const signal = controller.signal;
+
+  // Find CVEs that have a score but no vector (i.e. Shodan-enriched but missing NVD data)
+  const needsVector = cves.filter(cve => 
+    cve.vulnStatus !== 'REJECTED' &&
+    cve.cvss !== null &&
+    !cve.cvssVectorV40 && !cve.cvssVectorV31 && !cve.cvssVectorV30 && !cve.cvssVectorV20
+  );
+
+  if (needsVector.length === 0) {
+    callbacks.onComplete(cves);
+    return controller;
+  }
+
+  const BATCH_SIZE = 3;
+  const BATCH_DELAY_MS = 7000; // 7 seconds between batches to stay under 50 req / 30 sec
+
+  const run = async () => {
+    let completed = 0;
+
+    for (let i = 0; i < needsVector.length; i += BATCH_SIZE) {
+      if (signal.aborted) return;
+
+      const batch = needsVector.slice(i, i + BATCH_SIZE);
+
+      await Promise.all(batch.map(async (cve) => {
+        if (signal.aborted) return;
+        try {
+          const nvdUrl = `https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cve.id}`;
+          const proxyUrl = `https://cors.ja1712.workers.dev/?url=${encodeURIComponent(nvdUrl)}`;
+          const res = await fetch(proxyUrl, { signal });
+          
+          if (res.ok) {
+            const data = await res.json();
+            const metrics = data.vulnerabilities?.[0]?.cve?.metrics;
+            if (metrics) {
+              const cvssScores = extractLegacyCvss(metrics);
+              
+              // Update vectors (and scores if NVD has better data)
+              if (cvssScores.cvssV40.vector) {
+                cve.cvssVectorV40 = cvssScores.cvssV40.vector;
+                if (cvssScores.cvssV40.score !== null) cve.cvssV40 = cvssScores.cvssV40.score;
+              }
+              if (cvssScores.cvssV31.vector) {
+                cve.cvssVectorV31 = cvssScores.cvssV31.vector;
+                if (cvssScores.cvssV31.score !== null) cve.cvssV31 = cvssScores.cvssV31.score;
+              }
+              if (cvssScores.cvssV30.vector) {
+                cve.cvssVectorV30 = cvssScores.cvssV30.vector;
+                if (cvssScores.cvssV30.score !== null) cve.cvssV30 = cvssScores.cvssV30.score;
+              }
+              if (cvssScores.cvssV20.vector) {
+                cve.cvssVectorV20 = cvssScores.cvssV20.vector;
+                if (cvssScores.cvssV20.score !== null) cve.cvssV20 = cvssScores.cvssV20.score;
+              }
+
+              // Recalculate primary score with potentially better data
+              cve.cvss = getPrimaryCvssScore(cvssScores) ?? cve.cvss;
+            }
+          }
+        } catch (e: any) {
+          if (e?.name === 'AbortError') return;
+          console.warn(`NVD vector fetch failed for ${cve.id}`, e);
+        }
+      }));
+
+      completed += batch.length;
+      if (!signal.aborted) {
+        callbacks.onProgress([...cves], completed, needsVector.length);
+      }
+
+      // Wait between batches (except after the last one)
+      if (i + BATCH_SIZE < needsVector.length && !signal.aborted) {
+        await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+      }
+    }
+
+    if (!signal.aborted) {
+      callbacks.onComplete([...cves]);
+    }
+  };
+
+  run();
+  return controller;
 };
